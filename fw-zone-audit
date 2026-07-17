@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Audit firewalld zones and count direct source address entries.
+
+set -euo pipefail
+
+ZONE_DIR="/etc/firewalld/zones"
+
+if [[ ! -d "${ZONE_DIR}" ]]; then
+    echo "ERROR: firewalld zone directory not found: ${ZONE_DIR}" >&2
+    exit 1
+fi
+
+shopt -s nullglob
+zone_files=("${ZONE_DIR}"/*.xml)
+
+if (( ${#zone_files[@]} == 0 )); then
+    echo "No custom firewalld zone files found in ${ZONE_DIR}."
+    exit 0
+fi
+
+printf '%-24s %10s\n' "ZONE" "SOURCES"
+printf '%-24s %10s\n' "------------------------" "----------"
+
+total=0
+
+for zone_file in "${zone_files[@]}"; do
+    zone="$(basename "${zone_file}" .xml)"
+    count="$(grep -cE '<source[[:space:]]+address=' "${zone_file}" || true)"
+
+    printf '%-24s %10d\n' "${zone}" "${count}"
+    total=$((total + count))
+done
+
+printf '%-24s %10s\n' "------------------------" "----------"
+printf '%-24s %10d\n' "TOTAL" "${total}"
