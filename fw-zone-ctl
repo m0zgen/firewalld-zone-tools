@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+#
+# Helper for managing firewalld zones and source ipsets.
+#
+# Examples:
+#   fw-zone internal list
+#   fw-zone internal add-ip 192.0.2.10
+#   fw-zone internal del-ip 192.0.2.10
+#   fw-zone internal add-port 9443/tcp
+#   fw-zone internal del-port 9443/tcp
+#   fw-zone internal add-service https
+#   fw-zone internal del-service https
+#
+# Expected ipset naming:
+#   <zone>_sources_v4
+#   <zone>_sources_v6
+
+set -Eeuo pipefail
+
+ZONE="${1:-}"
+ACTION="${2:-}"
+VALUE="${3:-}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  fw-zone <zone> list
+  fw-zone <zone> list-ip
+  fw-zone <zone> add-ip <IP|CIDR>
+  fw-zone <zone> del-ip <IP|CIDR>
+  fw-zone <zone> query-ip <IP|CIDR>
+
+  fw-zone <zone> add-port <PORT/PROTO>
+  fw-zone <zone> del-port <PORT/PROTO>
+
+  fw-zone <zone> add-service <SERVICE>
+  fw-zone <zone> del-service <SERVICE>
+
+  fw-zone <zone> reload
+  fw-zone <zone> check
+
+Examples:
+  fw-zone internal add-ip 192.0.2.10
+  fw-zone internal add-ip 192.0.2.0/24
+  fw-zone internal add-ip 2001:db8::10
+  fw-zone internal del-ip 192.0.2.10/32
+
+  fw-zone internal add-port 9443/tcp
+  fw-zone internal del-port 9443/tcp
+
+  fw-zone internal add-service https
+  fw-zone internal del-service mdns
+EOF
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+require_root() {
+    [[ ${EUID} -eq 0 ]] || die "run as root"
+}
+
+zone_exists() {
+    firewall-cmd --permanent --get-zones |
+        tr ' ' '\n' |
+        grep -Fxq "${ZONE}"
+}
+
+normalize_ip() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+value = sys.argv[1]
+
+try:
+    if "/" in value:
+        obj = ipaddress.ip_network(value, strict=False)
+    else:
+        ip = ipaddress.ip_address(value)
+
+        if ip.version == 4:
+            obj = ipaddress.ip_network(f"{value}/32", strict=False)
+        else:
+            obj = ipaddress.ip_network(f"{value}/128", strict=False)
+
+    print(obj)
+except ValueError as exc:
+    print(f"ERROR: invalid IP or network: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+detect_family() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+obj = ipaddress.ip_network(sys.argv[1], strict=False)
+print(obj.version)
+PY
+}
+
+get_ipset_name() {
+    local family="$1"
+
+    case "${family}" in
+        4)
+            echo "${ZONE}_sources_v4"
+            ;;
+        6)
+            echo "${ZONE}_sources_v6"
+            ;;
+        *)
+            die "unsupported address family: ${family}"
+            ;;
+    esac
+}
+
+ipset_exists() {
+    local ipset="$1"
+
+    firewall-cmd --permanent --get-ipsets |
+        tr ' ' '\n' |
+        grep -Fxq "${ipset}"
+}
+
+reload_firewalld() {
+    firewall-cmd --reload
+}
+
+require_root
+
+[[ -n "${ZONE}" ]] || {
+    usage
+    exit 1
+}
+
+[[ -n "${ACTION}" ]] || {
+    usage
+    exit 1
+}
+
+zone_exists || die "zone does not exist: ${ZONE}"
+
+case "${ACTION}" in
+    list)
+        firewall-cmd --zone="${ZONE}" --list-all
+        ;;
+
+    list-ip)
+        for family in 4 6; do
+            ipset="$(get_ipset_name "${family}")"
+
+            echo
+            echo "=== ${ipset} ==="
+
+            if ipset_exists "${ipset}"; then
+                firewall-cmd \
+                    --permanent \
+                    --ipset="${ipset}" \
+                    --get-entries |
+                    sort -V
+            else
+                echo "not found"
+            fi
+        done
+        ;;
+
+    add-ip | del-ip | query-ip)
+        [[ -n "${VALUE}" ]] || die "IP address or network is required"
+
+        normalized="$(normalize_ip "${VALUE}")"
+        family="$(detect_family "${normalized}")"
+        ipset="$(get_ipset_name "${family}")"
+
+        ipset_exists "${ipset}" ||
+            die "ipset does not exist: ${ipset}"
+
+        case "${ACTION}" in
+            add-ip)
+                firewall-cmd \
+                    --permanent \
+                    --ipset="${ipset}" \
+                    --add-entry="${normalized}"
+
+                reload_firewalld
+
+                firewall-cmd \
+                    --ipset="${ipset}" \
+                    --query-entry="${normalized}"
+
+                echo "Added ${normalized} to ${ipset}"
+                ;;
+
+            del-ip)
+                firewall-cmd \
+                    --permanent \
+                    --ipset="${ipset}" \
+                    --remove-entry="${normalized}"
+
+                reload_firewalld
+
+                echo "Removed ${normalized} from ${ipset}"
+                ;;
+
+            query-ip)
+                firewall-cmd \
+                    --ipset="${ipset}" \
+                    --query-entry="${normalized}"
+                ;;
+        esac
+        ;;
+
+    add-port | del-port)
+        [[ -n "${VALUE}" ]] || die "port is required, for example 9443/tcp"
+
+        [[ "${VALUE}" =~ ^[0-9]+(-[0-9]+)?/(tcp|udp|sctp|dccp)$ ]] ||
+            die "invalid port format: ${VALUE}"
+
+        if [[ "${ACTION}" == "add-port" ]]; then
+            firewall-cmd \
+                --permanent \
+                --zone="${ZONE}" \
+                --add-port="${VALUE}"
+
+            reload_firewalld
+            echo "Added port ${VALUE} to zone ${ZONE}"
+        else
+            firewall-cmd \
+                --permanent \
+                --zone="${ZONE}" \
+                --remove-port="${VALUE}"
+
+            reload_firewalld
+            echo "Removed port ${VALUE} from zone ${ZONE}"
+        fi
+        ;;
+
+    add-service | del-service)
+        [[ -n "${VALUE}" ]] || die "service name is required"
+
+        firewall-cmd --get-services |
+            tr ' ' '\n' |
+            grep -Fxq "${VALUE}" ||
+            die "unknown firewalld service: ${VALUE}"
+
+        if [[ "${ACTION}" == "add-service" ]]; then
+            firewall-cmd \
+                --permanent \
+                --zone="${ZONE}" \
+                --add-service="${VALUE}"
+
+            reload_firewalld
+            echo "Added service ${VALUE} to zone ${ZONE}"
+        else
+            firewall-cmd \
+                --permanent \
+                --zone="${ZONE}" \
+                --remove-service="${VALUE}"
+
+            reload_firewalld
+            echo "Removed service ${VALUE} from zone ${ZONE}"
+        fi
+        ;;
+
+    reload)
+        reload_firewalld
+        echo "firewalld reloaded"
+        ;;
+
+    check)
+        echo "Checking permanent configuration..."
+        firewall-offline-cmd --check-config
+
+        echo
+        echo "Zone:"
+        firewall-cmd --zone="${ZONE}" --list-all
+
+        echo
+        echo "Runtime/permanent consistency:"
+        firewall-cmd --check-config
+        ;;
+
+    help | --help | -h)
+        usage
+        ;;
+
+    *)
+        die "unknown action: ${ACTION}"
+        ;;
+esac
