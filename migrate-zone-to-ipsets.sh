@@ -71,31 +71,26 @@ require_commands() {
         firewall-offline-cmd \
         systemctl \
         diff \
-        grep \
-        xmllint
+        grep
     do
-        if ! command -v "${command_name}" >/dev/null 2>&1; then
-            if [[ "${command_name}" == "xmllint" ]]; then
-                cat >&2 <<'EOF'
+        command -v "${command_name}" >/dev/null 2>&1 ||
+            die "required command is missing: ${command_name}"
+    done
+
+    if ! command -v xmllint >/dev/null 2>&1; then
+        cat >&2 <<'EOF'
 ERROR: required command is missing: xmllint
 
-Install it using:
+Install the required package:
 
   Debian/Ubuntu:
     apt install libxml2-utils
 
   RHEL/Rocky Linux/AlmaLinux/Fedora:
     dnf install libxml2
-
-Then run the migration again.
 EOF
-            else
-                echo "ERROR: required command is missing: ${command_name}" >&2
-            fi
-
-            exit 1
-        fi
-    done
+        exit 1
+    fi
 }
 
 if [[ ${EUID} -ne 0 ]]; then
