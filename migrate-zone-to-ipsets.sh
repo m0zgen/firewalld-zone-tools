@@ -63,10 +63,47 @@ rollback() {
 
 trap rollback ERR
 
+require_commands() {
+    local command_name
+
+    for command_name in \
+        python3 \
+        firewall-offline-cmd \
+        systemctl \
+        diff \
+        grep \
+        xmllint
+    do
+        if ! command -v "${command_name}" >/dev/null 2>&1; then
+            if [[ "${command_name}" == "xmllint" ]]; then
+                cat >&2 <<'EOF'
+ERROR: required command is missing: xmllint
+
+Install it using:
+
+  Debian/Ubuntu:
+    apt install libxml2-utils
+
+  RHEL/Rocky Linux/AlmaLinux/Fedora:
+    dnf install libxml2
+
+Then run the migration again.
+EOF
+            else
+                echo "ERROR: required command is missing: ${command_name}" >&2
+            fi
+
+            exit 1
+        fi
+    done
+}
+
 if [[ ${EUID} -ne 0 ]]; then
     echo "ERROR: run as root."
     exit 1
 fi
+
+require_commands
 
 if [[ ! -f "${ZONE_FILE}" ]]; then
     echo "ERROR: zone file not found:"
